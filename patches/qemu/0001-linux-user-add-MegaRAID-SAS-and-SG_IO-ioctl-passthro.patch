@@ -1,0 +1,285 @@
+From a97a25089d4ea2003ebc6dfc89d6eec1add746a0 Mon Sep 17 00:00:00 2001
+From: storcli-loongarch64 <itsupport@lierfang.com>
+Date: Sat, 14 Nov 2026 20:16:10 +0800
+Subject: [PATCH] linux-user: add MegaRAID SAS and SG_IO ioctl passthrough
+
+storcli talks to MegaRAID controllers through MEGASAS_IOC_FIRMWARE on
+/dev/megaraid_sas_ioctl_node and to disks through SG_IO.  Both ioctl
+arguments embed user-space pointers that the host kernel dereferences,
+so translate each embedded guest pointer to a host address.
+
+The structure layouts are shared only when guest and host have the same
+pointer size and endianness, so the entries are limited to that case
+(for example an x86_64 guest on a loongarch64 host).
+---
+ linux-user/ioctls.h        |   8 ++
+ linux-user/syscall.c       | 191 +++++++++++++++++++++++++++++++++++++
+ linux-user/syscall_defs.h  |   9 ++
+ linux-user/syscall_types.h |   6 ++
+ 4 files changed, 214 insertions(+)
+
+diff --git a/linux-user/ioctls.h b/linux-user/ioctls.h
+index aa485ee..0aec62e 100644
+--- a/linux-user/ioctls.h
++++ b/linux-user/ioctls.h
+@@ -152,6 +152,14 @@
+ #endif
+ 
+      IOCTL(FIGETBSZ, IOC_R, MK_PTR(TYPE_INT))
++
++#ifdef QEMU_HAVE_MEGASAS_SG_IO
++     IOCTL_SPECIAL(MEGASAS_IOC_FIRMWARE, IOC_RW, do_ioctl_megasas_fw,
++                   TYPE_PTRVOID)
++     IOCTL(MEGASAS_IOC_GET_AEN, IOC_W, MK_PTR(MK_STRUCT(STRUCT_megasas_aen)))
++     IOCTL(SG_GET_VERSION_NUM, IOC_R, MK_PTR(TYPE_INT))
++     IOCTL_SPECIAL(SG_IO, IOC_RW, do_ioctl_sg_io, TYPE_PTRVOID)
++#endif
+ #ifdef CONFIG_FIEMAP
+      IOCTL_SPECIAL(FS_IOC_FIEMAP, IOC_W | IOC_R, do_ioctl_fs_ioc_fiemap,
+                    MK_PTR(MK_STRUCT(STRUCT_fiemap)))
+diff --git a/linux-user/syscall.c b/linux-user/syscall.c
+index 9f45450..e4fdd3b 100644
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -110,6 +110,7 @@
+ #include <linux/usb/ch9.h>
+ #endif
+ #include <linux/vt.h>
++#include <scsi/sg.h>
+ #include <linux/dm-ioctl.h>
+ #include <linux/reboot.h>
+ #include <linux/route.h>
+@@ -5682,6 +5683,196 @@ static abi_long do_ioctl_TUNSETTXFILTER(const IOCTLEntry *ie, uint8_t *buf_temp,
+     return get_errno(safe_ioctl(fd, ie->host_cmd, filter));
+ }
+ 
++/*
++ * Broadcom/LSI MegaRAID SAS management ioctls and SCSI generic SG_IO.
++ *
++ * Both carry user-space pointers inside their argument structures, which
++ * the host kernel dereferences directly.  The structure layouts are only
++ * identical when guest and host share pointer size and endianness, so the
++ * passthrough is limited to that case (e.g. x86_64 guest on loongarch64).
++ * Every embedded guest pointer is checked and rewritten to a host address.
++ */
++#if TARGET_ABI_BITS == 64 && HOST_LONG_BITS == 64 && \
++    HOST_BIG_ENDIAN == TARGET_BIG_ENDIAN
++#define QEMU_HAVE_MEGASAS_SG_IO 1
++
++#define MEGASAS_MAX_IOCTL_SGE   16
++#define MEGASAS_FRAME_RAW_SIZE  128
++
++struct megasas_iocpacket {
++    uint16_t host_no;
++    uint16_t pad1;
++    uint32_t sgl_off;
++    uint32_t sge_count;
++    uint32_t sense_off;
++    uint32_t sense_len;
++    uint8_t frame[MEGASAS_FRAME_RAW_SIZE];
++    struct {
++        uint64_t iov_base;
++        uint64_t iov_len;
++    } QEMU_PACKED sgl[MEGASAS_MAX_IOCTL_SGE];
++} QEMU_PACKED;
++QEMU_BUILD_BUG_ON(sizeof(struct megasas_iocpacket) != 404);
++
++struct megasas_aen {
++    uint16_t host_no;
++    uint16_t pad1;
++    uint32_t seq_num;
++    uint32_t class_locale_word;
++} QEMU_PACKED;
++QEMU_BUILD_BUG_ON(sizeof(struct megasas_aen) != 12);
++
++#define MEGASAS_IOC_FIRMWARE    _IOWR('M', 1, struct megasas_iocpacket)
++#define MEGASAS_IOC_GET_AEN     _IOW('M', 3, struct megasas_aen)
++
++/* Translate a guest buffer address, verifying the whole range is mapped. */
++static bool passthrough_g2h(abi_ulong gaddr, abi_ulong len, uint64_t *hptr)
++{
++    void *p;
++
++    if (gaddr == 0) {
++        *hptr = 0;
++        return true;
++    }
++    p = lock_user(VERIFY_READ, gaddr, len, 0);
++    if (!p) {
++        return false;
++    }
++    unlock_user(p, gaddr, 0);
++    *hptr = (uintptr_t)p;
++    return true;
++}
++
++static abi_long do_ioctl_megasas_fw(const IOCTLEntry *ie, uint8_t *buf_temp,
++                                    int fd, int cmd, abi_long arg)
++{
++    struct megasas_iocpacket ioc, *gioc;
++    uint64_t sense_gptr = 0, sense_hptr;
++    abi_long ret;
++    uint32_t i;
++
++    gioc = lock_user(VERIFY_WRITE, arg, sizeof(ioc), 1);
++    if (!gioc) {
++        return -TARGET_EFAULT;
++    }
++    memcpy(&ioc, gioc, sizeof(ioc));
++
++    if (ioc.sge_count > MEGASAS_MAX_IOCTL_SGE) {
++        ret = -TARGET_EINVAL;
++        goto out;
++    }
++    for (i = 0; i < ioc.sge_count; i++) {
++        uint64_t hbase;
++
++        if (!passthrough_g2h(ioc.sgl[i].iov_base, ioc.sgl[i].iov_len,
++                             &hbase)) {
++            ret = -TARGET_EFAULT;
++            goto out;
++        }
++        ioc.sgl[i].iov_base = hbase;
++    }
++    if (ioc.sense_len) {
++        if (ioc.sense_off > MEGASAS_FRAME_RAW_SIZE - sizeof(uint64_t)) {
++            ret = -TARGET_EINVAL;
++            goto out;
++        }
++        memcpy(&sense_gptr, ioc.frame + ioc.sense_off, sizeof(sense_gptr));
++        if (!passthrough_g2h(sense_gptr, ioc.sense_len, &sense_hptr)) {
++            ret = -TARGET_EFAULT;
++            goto out;
++        }
++        memcpy(ioc.frame + ioc.sense_off, &sense_hptr, sizeof(sense_hptr));
++    }
++
++    ret = get_errno(safe_ioctl(fd, ie->host_cmd, &ioc));
++
++    /* The kernel reports completion status inside the frame header. */
++    if (ioc.sense_len) {
++        memcpy(ioc.frame + ioc.sense_off, &sense_gptr, sizeof(sense_gptr));
++    }
++    memcpy(gioc->frame, ioc.frame, sizeof(ioc.frame));
++out:
++    unlock_user(gioc, arg, sizeof(ioc));
++    return ret;
++}
++
++static abi_long do_ioctl_sg_io(const IOCTLEntry *ie, uint8_t *buf_temp,
++                               int fd, int cmd, abi_long arg)
++{
++    struct sg_io_hdr hdr, *ghdr;
++    uint64_t g_dxferp, g_cmdp, g_sbp, h;
++    struct iovec *hiov = NULL;
++    abi_long ret;
++    int i;
++
++    ghdr = lock_user(VERIFY_WRITE, arg, sizeof(hdr), 1);
++    if (!ghdr) {
++        return -TARGET_EFAULT;
++    }
++    memcpy(&hdr, ghdr, sizeof(hdr));
++    g_dxferp = (uintptr_t)hdr.dxferp;
++    g_cmdp = (uintptr_t)hdr.cmdp;
++    g_sbp = (uintptr_t)hdr.sbp;
++
++    if (hdr.interface_id != 'S') {
++        ret = -TARGET_ENOSYS;
++        goto out;
++    }
++    if (!passthrough_g2h(g_cmdp, hdr.cmd_len, &h)) {
++        ret = -TARGET_EFAULT;
++        goto out;
++    }
++    hdr.cmdp = (void *)(uintptr_t)h;
++    if (!passthrough_g2h(g_sbp, hdr.mx_sb_len, &h)) {
++        ret = -TARGET_EFAULT;
++        goto out;
++    }
++    hdr.sbp = (void *)(uintptr_t)h;
++
++    if (hdr.iovec_count) {
++        struct target_iovec *giov;
++
++        giov = lock_user(VERIFY_READ, g_dxferp,
++                         hdr.iovec_count * sizeof(*giov), 1);
++        if (!giov) {
++            ret = -TARGET_EFAULT;
++            goto out;
++        }
++        hiov = g_new(struct iovec, hdr.iovec_count);
++        for (i = 0; i < hdr.iovec_count; i++) {
++            abi_ulong len = tswapal(giov[i].iov_len);
++
++            if (!passthrough_g2h(tswapal(giov[i].iov_base), len, &h)) {
++                unlock_user(giov, g_dxferp, 0);
++                ret = -TARGET_EFAULT;
++                goto out;
++            }
++            hiov[i].iov_base = (void *)(uintptr_t)h;
++            hiov[i].iov_len = len;
++        }
++        unlock_user(giov, g_dxferp, 0);
++        hdr.dxferp = hiov;
++    } else {
++        if (!passthrough_g2h(g_dxferp, hdr.dxfer_len, &h)) {
++            ret = -TARGET_EFAULT;
++            goto out;
++        }
++        hdr.dxferp = (void *)(uintptr_t)h;
++    }
++
++    ret = get_errno(safe_ioctl(fd, ie->host_cmd, &hdr));
++
++    hdr.dxferp = (void *)(uintptr_t)g_dxferp;
++    hdr.cmdp = (void *)(uintptr_t)g_cmdp;
++    hdr.sbp = (void *)(uintptr_t)g_sbp;
++    memcpy(ghdr, &hdr, sizeof(hdr));
++out:
++    g_free(hiov);
++    unlock_user(ghdr, arg, sizeof(hdr));
++    return ret;
++}
++#endif /* 64-bit same-endian guest and host */
++
+ IOCTLEntry ioctl_entries[] = {
+ #define IOCTL(cmd, access, ...) \
+     { TARGET_ ## cmd, cmd, #cmd, access, 0, {  __VA_ARGS__ } },
+diff --git a/linux-user/syscall_defs.h b/linux-user/syscall_defs.h
+index f5831a6..1c29822 100644
+--- a/linux-user/syscall_defs.h
++++ b/linux-user/syscall_defs.h
+@@ -949,6 +949,15 @@ struct target_rtc_pll_info {
+ #define TARGET_FITHAW    TARGET_IOWR('X', 120, abi_int)
+ #define TARGET_FITRIM    TARGET_IOWR('X', 121, struct fstrim_range)
+ 
++/* Broadcom MegaRAID SAS management (drivers/scsi/megaraid/megaraid_sas.h) */
++#define TARGET_MEGASAS_IOC_FIRMWARE \
++        TARGET_IOC(TARGET_IOC_READ | TARGET_IOC_WRITE, 'M', 1, 404)
++#define TARGET_MEGASAS_IOC_GET_AEN  TARGET_IOC(TARGET_IOC_WRITE, 'M', 3, 12)
++
++/* SCSI generic (scsi/sg.h) */
++#define TARGET_SG_GET_VERSION_NUM   0x2282
++#define TARGET_SG_IO                0x2285
++
+ /*
+  * Note that the ioctl numbers for FS_IOC_<GET|SET><FLAGS|VERSION>
+  * claim type "long" but the actual type used by the kernel is "int".
+diff --git a/linux-user/syscall_types.h b/linux-user/syscall_types.h
+index ac45705..9620065 100644
+--- a/linux-user/syscall_types.h
++++ b/linux-user/syscall_types.h
+@@ -645,3 +645,9 @@ STRUCT(usbdevfs_disconnect_claim,
+         TYPE_INT, /* flags */
+         MK_ARRAY(TYPE_CHAR, USBDEVFS_MAXDRIVERNAME + 1)) /* driver */
+ #endif /* CONFIG_USBFS */
++
++STRUCT(megasas_aen,
++       TYPE_SHORT, /* host_no */
++       TYPE_SHORT, /* pad1 */
++       TYPE_INT,   /* seq_num */
++       TYPE_INT)   /* class_locale_word */
+-- 
+2.47.3
+

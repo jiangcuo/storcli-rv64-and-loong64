@@ -1,0 +1,91 @@
+# Build static QEMU + storcli deb/rpm for loong64 and riscv64.
+# Pushing a tag v<STORCLI_VERSION>-<PKG_RELEASE> (see scripts/common.sh),
+# e.g. v007.3811.0000-1, publishes the packages as a GitHub release.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [loong64, riscv64]
+    steps:
+      - uses: actions/checkout@v7
+
+      # QEMU source and the Broadcom bundle are pinned by sha256 in common.sh.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            work/qemu-*.tar.xz
+            work/STORCLI_*.zip
+          key: downloads-${{ hashFiles('scripts/common.sh') }}
+
+      - name: Build
+        run: CONTAINER_RUNTIME=docker ./build.sh ${{ matrix.arch }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: storcli-${{ matrix.arch }}
+          path: |
+            out/${{ matrix.arch }}/*.deb
+            out/${{ matrix.arch }}/*.rpm
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check tag matches package version
+        id: version
+        run: |
+          . scripts/common.sh
+          expected="v$STORCLI_VERSION-$PKG_RELEASE"
+          if [ "$GITHUB_REF_NAME" != "$expected" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match $expected from scripts/common.sh"
+              exit 1
+          fi
+          echo "storcli=$STORCLI_VERSION" >> "$GITHUB_OUTPUT"
+          echo "qemu=$QEMU_VERSION" >> "$GITHUB_OUTPUT"
+          echo "zip=$STORCLI_ZIP" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum *.deb *.rpm > SHA256SUMS
+          cat > notes.md <<EOF
+          StorCLI ${{ steps.version.outputs.storcli }} (Broadcom \`${{ steps.version.outputs.zip }}\`, signature verified)
+          running under static QEMU ${{ steps.version.outputs.qemu }} user-mode with MegaRAID/SG_IO ioctl passthrough.
+
+          | Arch | deb | rpm |
+          |---|---|---|
+          | LoongArch64 (new world only) | \`loong64\` | \`loongarch64\` |
+          | RISC-V 64 | \`riscv64\` | \`riscv64\` |
+
+          \`\`\`
+          $(cat SHA256SUMS)
+          \`\`\`
+          EOF
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --title "storcli $GITHUB_REF_NAME" --notes-file notes.md \
+              *.deb *.rpm SHA256SUMS

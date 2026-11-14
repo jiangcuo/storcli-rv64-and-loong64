@@ -1,0 +1,24 @@
+storcli for loong64 / riscv64
+=============================
+
+Broadcom ships StorCLI for Linux only as an x86_64 binary.  This package
+runs that official binary, unmodified, through a statically linked
+qemu-x86_64 user-mode emulator built for the local architecture.
+
+Files
+  /opt/MegaRAID/storcli/storcli64             wrapper, same path as upstream
+  /opt/MegaRAID/storcli/x86_64/storcli64      official Broadcom binary
+  /opt/MegaRAID/storcli/x86_64/qemu-x86_64    static QEMU user-mode emulator
+
+The QEMU build carries a patch (qemu-patches/) that passes the MegaRAID
+management ioctl (MEGASAS_IOC_FIRMWARE, MEGASAS_IOC_GET_AEN) and SCSI
+generic SG_IO through to the host kernel, translating the guest pointers
+embedded in those structures.
+
+LoongArch: only new-world (ABI2.0, kernel >= 5.19) systems are supported.
+The wrapper refuses to run on old-world kernels.
+
+Licensing
+  StorCLI: Broadcom license agreement, see LICENSE-Broadcom-EULA.txt and
+           ThirdPartyLicenseNotice.pdf.
+  QEMU:    GPL-2.0, see COPYING.qemu, qemu-source.txt and qemu-patches/.

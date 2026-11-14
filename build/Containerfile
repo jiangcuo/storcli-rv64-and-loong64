@@ -1,0 +1,17 @@
+# Cross-build environment: Debian 14 (forky) amd64 with the official
+# loong64 and riscv64 multiarch archives.  Builds static qemu-x86_64 for
+# both architectures and packages them as deb and rpm, all on x86_64.
+FROM docker.io/library/debian:forky
+
+RUN dpkg --add-architecture loong64 \
+ && dpkg --add-architecture riscv64 \
+ && apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates curl xz-utils patch file rpm unzip gpg gpgv \
+        python3 python3-venv ninja-build pkgconf bzip2 gcc libc6-dev \
+        gcc-loongarch64-linux-gnu gcc-riscv64-linux-gnu \
+        libc6-dev:loong64 libglib2.0-dev:loong64 libpcre2-dev:loong64 \
+        zlib1g-dev:loong64 libffi-dev:loong64 \
+        libc6-dev:riscv64 libglib2.0-dev:riscv64 libpcre2-dev:riscv64 \
+        zlib1g-dev:riscv64 libffi-dev:riscv64 \
+ && rm -rf /var/lib/apt/lists/*
